@@ -626,6 +626,17 @@ def build_skills_system_prompt(
         or ""
     )
     disabled = get_disabled_skill_names()
+
+    # ── compact index mode ─────────────────────────────────────────────
+    # When skills.compact_index is true, only category + skill names are
+    # injected (no descriptions).  Cuts ~70-80% of skill-related tokens.
+    try:
+        from hermes_cli.config import load_config
+        _skills_cfg = (load_config() or {}).get("skills", {})
+        _compact_index = bool(_skills_cfg.get("compact_index", False))
+    except Exception:
+        _compact_index = False
+
     cache_key = (
         str(skills_dir.resolve()),
         tuple(str(d) for d in external_dirs),
@@ -633,6 +644,7 @@ def build_skills_system_prompt(
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
         tuple(sorted(disabled)),
+        _compact_index,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -653,6 +665,9 @@ def build_skills_system_prompt(
                 continue
             skill_name = entry.get("skill_name") or ""
             category = entry.get("category") or "general"
+            # Skip archived tier skills (never auto-injected)
+            if category.startswith("archived"):
+                continue
             frontmatter_name = entry.get("frontmatter_name") or skill_name
             platforms = entry.get("platforms") or []
             if not skill_matches_platform({"platforms": platforms}):
@@ -676,6 +691,10 @@ def build_skills_system_prompt(
         # Cold path: full filesystem scan + write snapshot for next time
         skill_entries: list[dict] = []
         for skill_file in iter_skill_index_files(skills_dir, "SKILL.md"):
+            # Skip archived tier skills (never auto-injected)
+            rel = str(skill_file.relative_to(skills_dir))
+            if rel.startswith("archived"):
+                continue
             is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
             entry = _build_snapshot_entry(skill_file, skills_dir, frontmatter, desc)
             skill_entries.append(entry)
@@ -696,6 +715,10 @@ def build_skills_system_prompt(
 
         # Read category-level DESCRIPTION.md files
         for desc_file in iter_skill_index_files(skills_dir, "DESCRIPTION.md"):
+            # Skip archived tier descriptions
+            rel = str(desc_file.relative_to(skills_dir))
+            if rel.startswith("archived"):
+                continue
             try:
                 content = desc_file.read_text(encoding="utf-8")
                 fm, _ = parse_frontmatter(content)
@@ -729,6 +752,10 @@ def build_skills_system_prompt(
             continue
         for skill_file in iter_skill_index_files(ext_dir, "SKILL.md"):
             try:
+                # Skip archived tier skills from external dirs
+                rel = str(skill_file.relative_to(ext_dir))
+                if rel.startswith("archived"):
+                    continue
                 is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
                 if not is_compatible:
                     continue
@@ -755,6 +782,10 @@ def build_skills_system_prompt(
         # External category descriptions
         for desc_file in iter_skill_index_files(ext_dir, "DESCRIPTION.md"):
             try:
+                # Skip archived tier descriptions
+                rel = str(desc_file.relative_to(ext_dir))
+                if rel.startswith("archived"):
+                    continue
                 content = desc_file.read_text(encoding="utf-8")
                 fm, _ = parse_frontmatter(content)
                 cat_desc = fm.get("description")
@@ -769,47 +800,79 @@ def build_skills_system_prompt(
     if not skills_by_category:
         result = ""
     else:
-        index_lines = []
-        for category in sorted(skills_by_category.keys()):
-            cat_desc = category_descriptions.get(category, "")
-            if cat_desc:
-                index_lines.append(f"  {category}: {cat_desc}")
-            else:
-                index_lines.append(f"  {category}:")
-            # Deduplicate and sort skills within each category
-            seen = set()
-            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
-                if name in seen:
-                    continue
-                seen.add(name)
-                if desc:
-                    index_lines.append(f"    - {name}: {desc}")
+        if _compact_index:
+            # Ultra-compact: category + comma-separated names only (~70-80% token saving)
+            index_lines = []
+            for category in sorted(skills_by_category.keys()):
+                names = []
+                seen = set()
+                for name, _desc in sorted(skills_by_category[category], key=lambda x: x[0]):
+                    if name not in seen:
+                        seen.add(name)
+                        names.append(name)
+                if names:
+                    index_lines.append(f'  {category}: {", ".join(names)}')
+            result = (
+                "## Skills (mandatory)\n"
+                "Before replying, scan the skills below. If a skill matches or is even partially relevant "
+                "to your task, you MUST load it with skill_view(name) and follow its instructions. "
+                "Err on the side of loading — it is always better to have context you don't need "
+                "than to miss critical steps, pitfalls, or established workflows.\n"
+                "\n"
+                "<available_skills>\n"
+                + "\n".join(index_lines) + "\n"
+                "</available_skills>\n"
+                "\n"
+                "Only proceed without loading a skill if genuinely none are relevant to the task."
+            )
+        else:
+            # Full index with descriptions (higher token cost)
+            # Low-tier skills get truncated descriptions to save tokens
+            index_lines = []
+            for category in sorted(skills_by_category.keys()):
+                cat_desc = category_descriptions.get(category, "")
+                if cat_desc:
+                    index_lines.append(f"  {category}: {cat_desc}")
                 else:
-                    index_lines.append(f"    - {name}")
+                    index_lines.append(f"  {category}:")
+                # Deduplicate and sort skills within each category
+                seen = set()
+                is_low = category.startswith("low")
+                for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
+                    if name in seen:
+                        continue
+                    seen.add(name)
+                    if desc:
+                        # Truncate low-tier descriptions aggressively
+                        if is_low:
+                            desc = (desc[:20] + "...") if len(desc) > 20 else desc
+                        index_lines.append(f"    - {name}: {desc}")
+                    else:
+                        index_lines.append(f"    - {name}")
 
-        result = (
-            "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
-            "Err on the side of loading — it is always better to have context you don't need "
-            "than to miss critical steps, pitfalls, or established workflows. "
-            "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
-            "and proven workflows that outperform general-purpose approaches. Load the skill "
-            "even if you think you could handle the task with basic tools like web_search or terminal. "
-            "Skills also encode the user's preferred approach, conventions, and quality standards "
-            "for tasks like code review, planning, and testing — load them even for tasks you "
-            "already know how to do, because the skill defines how it should be done here.\n"
-            "If a skill has issues, fix it with skill_manage(action='patch').\n"
-            "After difficult/iterative tasks, offer to save as a skill. "
-            "If a skill you loaded was missing steps, had wrong commands, or needed "
-            "pitfalls you discovered, update it before finishing.\n"
-            "\n"
-            "<available_skills>\n"
-            + "\n".join(index_lines) + "\n"
-            "</available_skills>\n"
-            "\n"
-            "Only proceed without loading a skill if genuinely none are relevant to the task."
-        )
+            result = (
+                "## Skills (mandatory)\n"
+                "Before replying, scan the skills below. If a skill matches or is even partially relevant "
+                "to your task, you MUST load it with skill_view(name) and follow its instructions. "
+                "Err on the side of loading — it is always better to have context you don't need "
+                "than to miss critical steps, pitfalls, or established workflows. "
+                "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
+                "and proven workflows that outperform general-purpose approaches. Load the skill "
+                "even if you think you could handle the task with basic tools like web_search or terminal. "
+                "Skills also encode the user's preferred approach, conventions, and quality standards "
+                "for tasks like code review, planning, and testing — load them even for tasks you "
+                "already know how to do, because the skill defines how it should be done here.\n"
+                "If a skill has issues, fix it with skill_manage(action='patch').\n"
+                "After difficult/iterative tasks, offer to save as a skill. "
+                "If a skill you loaded was missing steps, had wrong commands, or needed "
+                "pitfalls you discovered, update it before finishing.\n"
+                "\n"
+                "<available_skills>\n"
+                + "\n".join(index_lines) + "\n"
+                "</available_skills>\n"
+                "\n"
+                "Only proceed without loading a skill if genuinely none are relevant to the task."
+            )
 
     # ── Store in LRU cache ────────────────────────────────────────────
     with _SKILLS_PROMPT_CACHE_LOCK:

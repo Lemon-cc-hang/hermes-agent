@@ -302,7 +302,11 @@ def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -
 # =============================================================================
 
 def _create_skill(name: str, content: str, category: str = None) -> Dict[str, Any]:
-    """Create a new user skill with SKILL.md content."""
+    """Create a new user skill with SKILL.md content.
+
+    New skills are always placed in the 'low/' tier directory.
+    If a category is provided, the skill goes to low/<category>/name.
+    """
     # Validate name
     err = _validate_name(name)
     if err:
@@ -329,8 +333,30 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
             "error": f"A skill named '{name}' already exists at {existing['path']}."
         }
 
-    # Create the skill directory
-    skill_dir = _resolve_skill_dir(name, category)
+    # Similarity guard against duplicate skills
+    try:
+        from agent.skill_tier_manager import check_similar_skill
+        fm = yaml.safe_load(content.split("---")[1]) if "---" in content else {}
+        desc = str(fm.get("description", ""))
+        similar = check_similar_skill(name, desc, threshold=0.5)
+        if similar:
+            return {
+                "success": False,
+                "error": (
+                    f"A similar skill '{similar}' already exists. "
+                    f"Consider updating it with skill_manage(action='patch') instead of creating a duplicate."
+                ),
+            }
+    except Exception as e:
+        logger.debug("Similarity check failed during skill creation: %s", e)
+
+    # Create the skill directory under low/ tier
+    from agent.skill_tier_manager import TIER_DIRS
+    tier_base = TIER_DIRS["low"]
+    if category:
+        skill_dir = tier_base / category / name
+    else:
+        skill_dir = tier_base / name
     skill_dir.mkdir(parents=True, exist_ok=True)
 
     # Write SKILL.md atomically
@@ -345,7 +371,7 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
 
     result = {
         "success": True,
-        "message": f"Skill '{name}' created.",
+        "message": f"Skill '{name}' created in low/ tier.",
         "path": str(skill_dir.relative_to(SKILLS_DIR)),
         "skill_md": str(skill_md),
     }
@@ -689,7 +715,8 @@ SKILL_MANAGE_SCHEMA = {
     "description": (
         "Manage skills (create, update, delete). Skills are your procedural "
         "memory — reusable approaches for recurring task types. "
-        f"New skills go to {display_hermes_home()}/skills/; existing skills can be modified wherever they live.\n\n"
+        f"New skills go to {display_hermes_home()}/skills/low/ (auto-tiered based on usage); "
+        f"existing skills can be modified wherever they live.\n\n"
         "Actions: create (full SKILL.md + optional category), "
         "patch (old_string/new_string — preferred for fixes), "
         "edit (full SKILL.md rewrite — major overhauls only), "

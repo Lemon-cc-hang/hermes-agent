@@ -1327,6 +1327,13 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
         if isinstance(metadata, dict):
             result["metadata"] = metadata
 
+        # Record skill view for tier analytics
+        try:
+            from agent.skill_tier_manager import record_skill_view
+            record_skill_view(skill_name)
+        except Exception as e:
+            logger.debug("Could not record skill view for %s: %s", skill_name, e)
+
         return json.dumps(result, ensure_ascii=False)
 
     except Exception as e:

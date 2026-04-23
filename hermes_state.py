@@ -31,11 +31,26 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS skill_daily_stats (
+    name TEXT NOT NULL,
+    date TEXT NOT NULL,
+    view_count INTEGER DEFAULT 0,
+    PRIMARY KEY (name, date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_skill_stats_date ON skill_daily_stats(date);
+
+CREATE TABLE IF NOT EXISTS skill_evaluation_log (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    session_count INTEGER DEFAULT 0,
+    last_evaluated TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -329,6 +344,24 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                # v7: skill tier system — daily stats + evaluation log
+                cursor.executescript("""
+                    CREATE TABLE IF NOT EXISTS skill_daily_stats (
+                        name TEXT NOT NULL,
+                        date TEXT NOT NULL,
+                        view_count INTEGER DEFAULT 0,
+                        PRIMARY KEY (name, date)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_skill_stats_date ON skill_daily_stats(date);
+                    CREATE TABLE IF NOT EXISTS skill_evaluation_log (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        session_count INTEGER DEFAULT 0,
+                        last_evaluated TIMESTAMP
+                    );
+                    INSERT OR IGNORE INTO skill_evaluation_log (id, session_count) VALUES (1, 0);
+                """)
+                cursor.execute("UPDATE schema_version SET version = 7")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -379,7 +412,33 @@ class SessionDB:
                     time.time(),
                 ),
             )
+            # Track session starts for skill tier auto-evaluation
+            if conn.total_changes > 0:
+                try:
+                    conn.execute(
+                        """INSERT INTO skill_evaluation_log (id, session_count, last_evaluated)
+                           VALUES (1, 1, datetime('now'))
+                           ON CONFLICT(id) DO UPDATE SET
+                           session_count = session_count + 1,
+                           last_evaluated = COALESCE(last_evaluated, datetime('now'))"""
+                    )
+                except Exception:
+                    pass  # Best effort
         self._execute_write(_do)
+        # Best-effort trigger tier evaluation every N sessions
+        try:
+            from agent.skill_tier_manager import get_session_eval_state, evaluate_and_migrate
+            count, _ = get_session_eval_state()
+            if count >= 15:
+                from agent.skill_tier_manager import _db as _tier_db
+                _tier_db()._execute_write(
+                    lambda conn: conn.execute(
+                        "UPDATE skill_evaluation_log SET session_count = 0 WHERE id = 1"
+                    )
+                )
+                evaluate_and_migrate()
+        except Exception as e:
+            logger.debug("Skill tier evaluation failed: %s", e)
         return session_id
 
     def end_session(self, session_id: str, end_reason: str) -> None:
