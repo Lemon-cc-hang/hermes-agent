@@ -395,11 +395,8 @@ class ContextCompressor(ContextEngine):
         5x keeps only the newest full copy) and truncates large tool_call
         arguments in assistant messages outside the protected tail.
 
-        Walks backward from the end, protecting the most recent messages that
-        fall within ``protect_tail_tokens`` (when provided) OR the last
-        ``protect_tail_count`` messages (backward-compatible default).
-        When both are given, the token budget takes priority and the message
-        count acts as a hard minimum floor.
+        Uses the same token-budget tail protection as the main compression
+        flow (``_find_tail_cut_by_tokens``) to ensure consistent boundaries.
 
         Returns (pruned_messages, pruned_count).
         """
@@ -425,30 +422,20 @@ class ContextCompressor(ContextEngine):
                         args_str = getattr(fn, "arguments", "") if fn else ""
                         call_id_to_tool[cid] = (name, args_str)
 
-        # Determine the prune boundary
+        # UNIFIED: Use the same token-budget boundary logic as main compression.
+        # This eliminates the duplicate (and buggy) boundary calculation that
+        # was previously embedded here.
+        #
+        # For tool pruning, we protect the tail starting from index 0 (no head
+        # protection needed here — the caller already handles head/tail splits).
+        # We pass protect_tail_count as the min_tail floor so at least that
+        # many messages are always protected.
         if protect_tail_tokens is not None and protect_tail_tokens > 0:
-            # Token-budget approach: walk backward accumulating tokens
-            accumulated = 0
-            boundary = len(result)  # default: protect everything
-            min_protect = min(protect_tail_count, len(result) - 1)
-            for i in range(len(result) - 1, -1, -1):
-                msg = result[i]
-                raw_content = msg.get("content") or ""
-                content_len = sum(len(p.get("text", "")) for p in raw_content) if isinstance(raw_content, list) else len(raw_content)
-                msg_tokens = content_len // _CHARS_PER_TOKEN + 10
-                for tc in msg.get("tool_calls") or []:
-                    if isinstance(tc, dict):
-                        args = tc.get("function", {}).get("arguments", "")
-                        msg_tokens += len(args) // _CHARS_PER_TOKEN
-                # Check if adding this message would exceed the token budget
-                if accumulated + msg_tokens > protect_tail_tokens and (len(result) - i) >= min_protect:
-                    boundary = i + 1  # prune UP TO (but not including) this message
-                    break
-                accumulated += msg_tokens
-                boundary = i  # this message fits within budget
-            prune_boundary = max(boundary, len(result) - min_protect)
+            prune_boundary = self._find_tail_cut_by_tokens(
+                result, head_end=0, token_budget=protect_tail_tokens
+            )
         else:
-            prune_boundary = len(result) - protect_tail_count
+            prune_boundary = max(0, len(result) - protect_tail_count)
 
         # Pass 1: Deduplicate identical tool results.
         # When the same file is read multiple times, keep only the most recent
