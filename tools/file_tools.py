@@ -215,6 +215,15 @@ def _cap_read_tracker_data(task_data: dict) -> None:
             except (StopIteration, KeyError):
                 break
 
+    cp = task_data.get("content_preview")
+    if cp is not None and len(cp) > _DEDUP_CAP:
+        excess = len(cp) - _DEDUP_CAP
+        for _ in range(excess):
+            try:
+                cp.pop(next(iter(cp)))
+            except (StopIteration, KeyError):
+                break
+
 
 def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     """Get or create ShellFileOperations for a terminal environment.
@@ -385,6 +394,8 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         # If we already read this exact (path, offset, limit) and the
         # file hasn't been modified since, return a lightweight stub
         # instead of re-sending the same content.  Saves context tokens.
+        # Includes a content preview so the model can decide if it needs
+        # the full file again (especially after context compression).
         resolved_str = str(_resolved)
         dedup_key = (resolved_str, offset, limit)
         with _read_tracker_lock:
@@ -398,11 +409,22 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
             try:
                 current_mtime = os.path.getmtime(resolved_str)
                 if current_mtime == cached_mtime:
+                    # Include a content preview so the model can judge whether
+                    # it needs the full file again (context compression may have
+                    # dropped the earlier read result).
+                    preview = task_data.get("content_preview", {}).get(dedup_key, "")
+                    preview_msg = ""
+                    if preview:
+                        preview_msg = (
+                            f"\n\n[Content preview from last read, first {len(preview)} chars]:\n"
+                            f"{preview}"
+                        )
                     return json.dumps({
                         "content": (
                             "File unchanged since last read. The content from "
                             "the earlier read_file result in this conversation is "
                             "still current — refer to that instead of re-reading."
+                            f"{preview_msg}"
                         ),
                         "path": path,
                         "dedup": True,
@@ -477,6 +499,12 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 _mtime_now = os.path.getmtime(resolved_str)
                 task_data["dedup"][dedup_key] = _mtime_now
                 task_data.setdefault("read_timestamps", {})[resolved_str] = _mtime_now
+                # Store a short content preview for dedup responses (helps the
+                # model judge whether it needs the full file after context
+                # compression has dropped the earlier read result).
+                if result.content:
+                    preview_text = result.content[:200]
+                    task_data.setdefault("content_preview", {})[dedup_key] = preview_text
             except OSError:
                 pass  # Can't stat — skip tracking for this entry
 

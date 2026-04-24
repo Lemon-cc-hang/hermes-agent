@@ -429,7 +429,7 @@ class ContextCompressor(ContextEngine):
         if protect_tail_tokens is not None and protect_tail_tokens > 0:
             # Token-budget approach: walk backward accumulating tokens
             accumulated = 0
-            boundary = len(result)
+            boundary = len(result)  # default: protect everything
             min_protect = min(protect_tail_count, len(result) - 1)
             for i in range(len(result) - 1, -1, -1):
                 msg = result[i]
@@ -440,11 +440,12 @@ class ContextCompressor(ContextEngine):
                     if isinstance(tc, dict):
                         args = tc.get("function", {}).get("arguments", "")
                         msg_tokens += len(args) // _CHARS_PER_TOKEN
+                # Check if adding this message would exceed the token budget
                 if accumulated + msg_tokens > protect_tail_tokens and (len(result) - i) >= min_protect:
-                    boundary = i
+                    boundary = i + 1  # prune UP TO (but not including) this message
                     break
                 accumulated += msg_tokens
-                boundary = i
+                boundary = i  # this message fits within budget
             prune_boundary = max(boundary, len(result) - min_protect)
         else:
             prune_boundary = len(result) - protect_tail_count

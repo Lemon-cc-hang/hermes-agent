@@ -56,6 +56,52 @@ from tools.interrupt import is_interrupted, _interrupt_event  # noqa: F401 — r
 # display_hermes_home imported lazily at call site (stale-module safety during hermes update)
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Per-task command failure tracking: block repeated failures to prevent
+# infinite retry loops (e.g. git push failing due to auth/network).
+# ──────────────────────────────────────────────────────────────────────
+_command_failure_tracker: dict = {}          # task_id -> {cmd_signature: [timestamp, ...]}
+_command_failure_lock = threading.Lock()
+_COMMAND_FAILURE_WINDOW = 300                # 5 minutes
+_COMMAND_FAILURE_BLOCK_THRESHOLD = 3         # block after 3 failures in window
+
+
+def _normalize_cmd_signature(command: str) -> str:
+    """Extract a stable signature from a command for failure tracking."""
+    # Take the first 3 whitespace-separated tokens (e.g. "git push origin")
+    # to group variants of the same base command.
+    parts = command.strip().split()
+    if not parts:
+        return ""
+    return " ".join(parts[:3]).lower()
+
+
+def _record_command_failure(task_id: str, command: str) -> None:
+    """Record a command failure for the given task."""
+    sig = _normalize_cmd_signature(command)
+    if not sig:
+        return
+    now = time.time()
+    with _command_failure_lock:
+        task_fails = _command_failure_tracker.setdefault(task_id, {})
+        fails = task_fails.setdefault(sig, [])
+        fails.append(now)
+        # prune old entries outside the window
+        cutoff = now - _COMMAND_FAILURE_WINDOW
+        task_fails[sig] = [t for t in fails if t > cutoff]
+
+
+def _get_recent_failure_count(task_id: str, command: str) -> int:
+    """Return how many times this command signature has failed recently."""
+    sig = _normalize_cmd_signature(command)
+    if not sig:
+        return 0
+    now = time.time()
+    with _command_failure_lock:
+        task_fails = _command_failure_tracker.get(task_id, {})
+        fails = task_fails.get(sig, [])
+        cutoff = now - _COMMAND_FAILURE_WINDOW
+        return len([t for t in fails if t > cutoff])
 
 
 # =============================================================================
@@ -1412,6 +1458,26 @@ def terminal_tool(
         # Use task_id for environment isolation
         effective_task_id = task_id or "default"
 
+        # Check for repeated command failures before executing (prevents
+        # infinite retry loops like git push failing due to auth/network).
+        if not background and not _looks_like_help_or_version_command(command):
+            recent_failures = _get_recent_failure_count(effective_task_id, command)
+            if recent_failures >= _COMMAND_FAILURE_BLOCK_THRESHOLD:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": (
+                        f"Command '{command}' has failed {recent_failures} times recently. "
+                        "This may indicate an environment issue (network, auth, config). "
+                        "Suggested actions:\n"
+                        "1. Check network connectivity and remote status\n"
+                        "2. Verify credentials (SSH key, token, permissions)\n"
+                        "3. Run with verbose flags to diagnose\n"
+                        "4. Ask the user for assistance"
+                    ),
+                    "status": "blocked",
+                }, ensure_ascii=False)
+
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config
         overrides = _task_env_overrides.get(effective_task_id, {})
@@ -1766,14 +1832,19 @@ def terminal_tool(
                 pass
             
             # Truncate output if too long, keeping both head and tail
-            MAX_OUTPUT_CHARS = 50000
+            MAX_OUTPUT_CHARS = 15000
             if len(output) > MAX_OUTPUT_CHARS:
                 head_chars = int(MAX_OUTPUT_CHARS * 0.4)  # 40% head (error messages often appear early)
                 tail_chars = MAX_OUTPUT_CHARS - head_chars  # 60% tail (most recent/relevant output)
                 omitted = len(output) - head_chars - tail_chars
                 truncated_notice = (
                     f"\n\n... [OUTPUT TRUNCATED - {omitted} chars omitted "
-                    f"out of {len(output)} total] ...\n\n"
+                    f"out of {len(output)} total] ...\n"
+                    f"To see omitted content, use one of these approaches:\n"
+                    f"  {command.split()[0] if command else 'command'} | head -N       (first N lines)\n"
+                    f"  {command.split()[0] if command else 'command'} | tail -N       (last N lines)\n"
+                    f"  {command.split()[0] if command else 'command'} | grep 'term'   (filter by keyword)\n"
+                    f"  {command.split()[0] if command else 'command'} | sed -n 'X,Yp' (lines X to Y)\n\n"
                 )
                 output = output[:head_chars] + truncated_notice + output[-tail_chars:]
 
@@ -1799,6 +1870,12 @@ def terminal_tool(
                 result_dict["approval"] = approval_note
             if exit_note:
                 result_dict["exit_code_meaning"] = exit_note
+
+            # Record command failures for loop-prevention (only foreground,
+            # non-informational commands).
+            if not background and not _looks_like_help_or_version_command(command):
+                if returncode != 0:
+                    _record_command_failure(effective_task_id, command)
 
             return json.dumps(result_dict, ensure_ascii=False)
 
