@@ -200,7 +200,7 @@ def evaluate_and_migrate(threshold: int = HIGH_VIEWS_THRESHOLD) -> List[Dict]:
     Rules:
       low  → high    : 7-day views > threshold
       high → low     : 7-day views <= threshold (and > 0)
-      low  → archived: 7-day views == 0  (and skill exists > 30 days)
+      low  → archived: 7-day views == 0
 
     Returns list of migration records for logging.
     """
@@ -222,21 +222,12 @@ def evaluate_and_migrate(threshold: int = HIGH_VIEWS_THRESHOLD) -> List[Dict]:
             move_skill_to_tier(name, "low")
             migrated.append({"skill": name, "from": "high", "to": "low", "views": views})
 
-    # low → archived (only if zero views AND older than 30 days)
-    cutoff = datetime.utcnow() - timedelta(days=30)
+    # low → archived (zero views in the last 7 days)
     for name in get_all_skills_by_tier().get("low", []):
         views = get_7day_views(name)
         if views == 0:
-            found = _find_skill_path(name)
-            if found:
-                skill_path, _ = found
-                try:
-                    mtime = datetime.utcfromtimestamp(skill_path.stat().st_mtime)
-                    if mtime < cutoff:
-                        move_skill_to_tier(name, "archived")
-                        migrated.append({"skill": name, "from": "low", "to": "archived", "views": 0})
-                except Exception:
-                    pass
+            move_skill_to_tier(name, "archived")
+            migrated.append({"skill": name, "from": "low", "to": "archived", "views": 0})
 
     if migrated:
         logger.info("Skill tier migrations: %s", migrated)

@@ -369,6 +369,13 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
         shutil.rmtree(skill_dir, ignore_errors=True)
         return {"success": False, "error": scan_error}
 
+    # Record initial view so newly-created skills don't get archived before first use
+    try:
+        from agent.skill_tier_manager import record_skill_view
+        record_skill_view(name)
+    except Exception:
+        pass
+
     result = {
         "success": True,
         "message": f"Skill '{name}' created in low/ tier.",
