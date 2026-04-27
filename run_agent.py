@@ -117,57 +117,16 @@ from agent.trajectory import (
     convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
 )
+from agent.core_utils import IterationBudget, install_safe_stdio
+from agent.runner_utils import (
+    _is_destructive_command,
+    _should_parallelize_tool_batch,
+    _extract_parallel_scope_path,
+    _paths_overlap,
+    _MAX_TOOL_WORKERS,
+)
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_var_enabled, normalize_proxy_url
 
-
-
-class _SafeWriter:
-    """Transparent stdio wrapper that catches OSError/ValueError from broken pipes.
-
-    When hermes-agent runs as a systemd service, Docker container, or headless
-    daemon, the stdout/stderr pipe can become unavailable (idle timeout, buffer
-    exhaustion, socket reset). Any print() call then raises
-    ``OSError: [Errno 5] Input/output error``, which can crash agent setup or
-    run_conversation() — especially via double-fault when an except handler
-    also tries to print.
-
-    Additionally, when subagents run in ThreadPoolExecutor threads, the shared
-    stdout handle can close between thread teardown and cleanup, raising
-    ``ValueError: I/O operation on closed file`` instead of OSError.
-
-    This wrapper delegates all writes to the underlying stream and silently
-    catches both OSError and ValueError. It is transparent when the wrapped
-    stream is healthy.
-    """
-
-    __slots__ = ("_inner",)
-
-    def __init__(self, inner):
-        object.__setattr__(self, "_inner", inner)
-
-    def write(self, data):
-        try:
-            return self._inner.write(data)
-        except (OSError, ValueError):
-            return len(data) if isinstance(data, str) else 0
-
-    def flush(self):
-        try:
-            self._inner.flush()
-        except (OSError, ValueError):
-            pass
-
-    def fileno(self):
-        return self._inner.fileno()
-
-    def isatty(self):
-        try:
-            return self._inner.isatty()
-        except (OSError, ValueError):
-            return False
-
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
 
 
 def _get_proxy_from_env() -> Optional[str]:
@@ -205,181 +164,17 @@ def _get_proxy_for_base_url(base_url: Optional[str]) -> Optional[str]:
 
 def _install_safe_stdio() -> None:
     """Wrap stdout/stderr so best-effort console output cannot crash the agent."""
-    for stream_name in ("stdout", "stderr"):
-        stream = getattr(sys, stream_name, None)
-        if stream is not None and not isinstance(stream, _SafeWriter):
-            setattr(sys, stream_name, _SafeWriter(stream))
+    install_safe_stdio()
 
 
-class IterationBudget:
-    """Thread-safe iteration counter for an agent.
-
-    Each agent (parent or subagent) gets its own ``IterationBudget``.
-    The parent's budget is capped at ``max_iterations`` (default 90).
-    Each subagent gets an independent budget capped at
-    ``delegation.max_iterations`` (default 50) — this means total
-    iterations across parent + subagents can exceed the parent's cap.
-    Users control the per-subagent limit via ``delegation.max_iterations``
-    in config.yaml.
-
-    ``execute_code`` (programmatic tool calling) iterations are refunded via
-    :meth:`refund` so they don't eat into the budget.
-    """
-
-    def __init__(self, max_total: int):
-        self.max_total = max_total
-        self._used = 0
-        self._lock = threading.Lock()
-
-    def consume(self) -> bool:
-        """Try to consume one iteration.  Returns True if allowed."""
-        with self._lock:
-            if self._used >= self.max_total:
-                return False
-            self._used += 1
-            return True
-
-    def refund(self) -> None:
-        """Give back one iteration (e.g. for execute_code turns)."""
-        with self._lock:
-            if self._used > 0:
-                self._used -= 1
-
-    @property
-    def used(self) -> int:
-        return self._used
-
-    @property
-    def remaining(self) -> int:
-        with self._lock:
-            return max(0, self.max_total - self._used)
+# _install_safe_stdio and IterationBudget are now imported from agent.core_utils
+# (see import block above). Kept here for backward compat.
 
 
 # Tools that must never run concurrently (interactive / user-facing).
 # When any of these appear in a batch, we fall back to sequential execution.
-_NEVER_PARALLEL_TOOLS = frozenset({"clarify"})
-
-# Read-only tools with no shared mutable session state.
-_PARALLEL_SAFE_TOOLS = frozenset({
-    "ha_get_state",
-    "ha_list_entities",
-    "ha_list_services",
-    "read_file",
-    "search_files",
-    "session_search",
-    "skill_view",
-    "skills_list",
-    "vision_analyze",
-    "web_extract",
-    "web_search",
-})
-
-# File tools can run concurrently when they target independent paths.
-_PATH_SCOPED_TOOLS = frozenset({"read_file", "write_file", "patch"})
-
-# Maximum number of concurrent worker threads for parallel tool execution.
-_MAX_TOOL_WORKERS = 8
-
-# Patterns that indicate a terminal command may modify/delete files.
-_DESTRUCTIVE_PATTERNS = re.compile(
-    r"""(?:^|\s|&&|\|\||;|`)(?:
-        rm\s|rmdir\s|
-        cp\s|install\s|
-        mv\s|
-        sed\s+-i|
-        truncate\s|
-        dd\s|
-        shred\s|
-        git\s+(?:reset|clean|checkout)\s
-    )""",
-    re.VERBOSE,
-)
-# Output redirects that overwrite files (> but not >>)
-_REDIRECT_OVERWRITE = re.compile(r'[^>]>[^>]|^>[^>]')
-
-
-def _is_destructive_command(cmd: str) -> bool:
-    """Heuristic: does this terminal command look like it modifies/deletes files?"""
-    if not cmd:
-        return False
-    if _DESTRUCTIVE_PATTERNS.search(cmd):
-        return True
-    if _REDIRECT_OVERWRITE.search(cmd):
-        return True
-    return False
-
-
-def _should_parallelize_tool_batch(tool_calls) -> bool:
-    """Return True when a tool-call batch is safe to run concurrently."""
-    if len(tool_calls) <= 1:
-        return False
-
-    tool_names = [tc.function.name for tc in tool_calls]
-    if any(name in _NEVER_PARALLEL_TOOLS for name in tool_names):
-        return False
-
-    reserved_paths: list[Path] = []
-    for tool_call in tool_calls:
-        tool_name = tool_call.function.name
-        try:
-            function_args = json.loads(tool_call.function.arguments)
-        except Exception:
-            logging.debug(
-                "Could not parse args for %s — defaulting to sequential; raw=%s",
-                tool_name,
-                tool_call.function.arguments[:200],
-            )
-            return False
-        if not isinstance(function_args, dict):
-            logging.debug(
-                "Non-dict args for %s (%s) — defaulting to sequential",
-                tool_name,
-                type(function_args).__name__,
-            )
-            return False
-
-        if tool_name in _PATH_SCOPED_TOOLS:
-            scoped_path = _extract_parallel_scope_path(tool_name, function_args)
-            if scoped_path is None:
-                return False
-            if any(_paths_overlap(scoped_path, existing) for existing in reserved_paths):
-                return False
-            reserved_paths.append(scoped_path)
-            continue
-
-        if tool_name not in _PARALLEL_SAFE_TOOLS:
-            return False
-
-    return True
-
-
-def _extract_parallel_scope_path(tool_name: str, function_args: dict) -> Path | None:
-    """Return the normalized file target for path-scoped tools."""
-    if tool_name not in _PATH_SCOPED_TOOLS:
-        return None
-
-    raw_path = function_args.get("path")
-    if not isinstance(raw_path, str) or not raw_path.strip():
-        return None
-
-    expanded = Path(raw_path).expanduser()
-    if expanded.is_absolute():
-        return Path(os.path.abspath(str(expanded)))
-
-    # Avoid resolve(); the file may not exist yet.
-    return Path(os.path.abspath(str(Path.cwd() / expanded)))
-
-
-def _paths_overlap(left: Path, right: Path) -> bool:
-    """Return True when two paths may refer to the same subtree."""
-    left_parts = left.parts
-    right_parts = right.parts
-    if not left_parts or not right_parts:
-        # Empty paths shouldn't reach here (guarded upstream), but be safe.
-        return bool(left_parts) == bool(right_parts) and bool(left_parts)
-    common_len = min(len(left_parts), len(right_parts))
-    return left_parts[:common_len] == right_parts[:common_len]
-
+# Tool parallelization constants and helpers are imported from agent.runner_utils
+# (see import block above). Kept here for backward compat.
 
 
 _SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
@@ -1177,7 +972,14 @@ class AIAgent:
         self._current_tool: str | None = None
         self._api_call_count: int = 0
 
-        # Rate limit tracking — updated from x-ratelimit-* response headers
+        # Circuit breaker \u2014 consecutive API error tracking.
+        # When the same error recurs N times, stop retrying to prevent
+        # infinite loops (e.g. fallback A \u2192 fallback B \u2192 fallback A).
+        self._consecutive_api_errors: int = 0
+        self._max_consecutive_api_errors: int = 9  # 3 retries \u00d7 3 providers max
+        self._last_api_error_hash: str = ""  # Fingerprint of the last error
+
+        # Rate limit tracking \u2014 updated from x-ratelimit-* response headers
         # after each API call.  Accessed by /usage slash command.
         self._rate_limit_state: Optional["RateLimitState"] = None
 
@@ -4571,6 +4373,31 @@ class AIAgent:
                     prompt_parts.append(_ext_mem_block)
             except Exception:
                 pass
+
+        # ── FileMemoryStore: inject relevant memories into system prompt ──
+        _fms = getattr(self, "_file_memory_store", None)
+        if _fms is None:
+            try:
+                from agent.file_memory import FileMemoryStore
+                self._file_memory_store = FileMemoryStore()
+                _fms = self._file_memory_store
+            except Exception:
+                _fms = None
+        if _fms is not None:
+            try:
+                # Inject up to 5 most relevant user memories + 3 project memories.
+                _user_mems = _fms.search("", category="user")[:5]
+                _proj_mems = _fms.search("", category="project")[:3]
+                if _user_mems or _proj_mems:
+                    _mem_lines = ["📝 来自 FileMemoryStore 的记忆:"]
+                    for m in _user_mems:
+                        _mem_lines.append(f"- [user/{m['id']}] {m['preview']}")
+                    for m in _proj_mems:
+                        _mem_lines.append(f"- [project/{m['id']}] {m['preview']}")
+                    prompt_parts.append("\n".join(_mem_lines))
+            except Exception:
+                pass
+        # ── End FileMemoryStore ────────────────────────────────────────────────
 
         has_skills_tools = any(name in self.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
         if has_skills_tools:
@@ -8194,6 +8021,31 @@ class AIAgent:
         self.context_compressor.last_prompt_tokens = _compressed_est
         self.context_compressor.last_completion_tokens = 0
 
+        # ── Compact Boundary marker ──────────────────────────────────────────────
+        # Inject a structural boundary marker into the first summary message
+        # so the model knows what information may have been lost.
+        _compression_count = getattr(self.context_compressor, "compression_count", 0)
+        _boundary_msg = (
+            f"<compact-boundary\n"
+            f"  original_messages='{_pre_msg_count}'\n"
+            f"  compressed_messages='{len(compressed)}'\n"
+            f"  original_tokens='{approx_tokens or _compressed_est}'\n"
+            f"  compression_count='{_compression_count}'\n"
+            f"  timestamp='{datetime.now().isoformat()}' />\n"
+            f"All conversation above this boundary has been summarized.\n"
+            f"Do not reference specific details from earlier turns unless "
+            f"they appear in the summary."
+        )
+        if compressed and len(compressed) > 0:
+            _first = compressed[0]
+            if isinstance(_first, dict) and isinstance(_first.get("content"), str):
+                _first["content"] = _boundary_msg + "\n\n" + _first["content"]
+            else:
+                compressed.insert(0, {"role": "system", "content": _boundary_msg})
+        else:
+            compressed.insert(0, {"role": "system", "content": _boundary_msg})
+        # ── End Compact Boundary ─────────────────────────────────────────────
+
         # Clear the file-read dedup cache.  After compression the original
         # read content is summarised away — if the model re-reads the same
         # file it needs the full content, not a "file unchanged" stub.
@@ -9434,7 +9286,46 @@ class AIAgent:
         # ── Preflight context compression ──
         # Before entering the main loop, check if the loaded conversation
         # history already exceeds the model's context threshold.  This handles
-        # cases where a user switches to a model with a smaller context window
+        # ── MicroCompact: lightweight tool-output cleanup (zero API calls) ──
+        # Triggered when tokens are in the 50–75% range, *before* the
+        # expensive ContextCompressor (which fires at >=threshold_tokens).
+        _mc = getattr(self, "_micro_compact", None)
+        if _mc is None:
+            from agent.micro_compact import MicroCompact
+            self._micro_compact = MicroCompact()
+            _mc = self._micro_compact
+        if (
+            self.compression_enabled
+            and len(messages) > self.context_compressor.protect_first_n
+                                + self.context_compressor.protect_last_n + 1
+        ):
+            _preflight_tokens_mc = estimate_request_tokens_rough(
+                messages,
+                system_prompt=active_system_prompt or "",
+                tools=self.tools or None,
+            )
+            if _mc.should_compact(_preflight_tokens_mc, self.context_compressor.threshold_tokens):
+                _orig_len_mc = len(messages)
+                messages = _mc.compact(messages)
+                if len(messages) < _orig_len_mc:
+                    _stats = _mc.get_stats()
+                    self._vprint(
+                        f"{self.log_prefix}🧹 MicroCompact: cleared {_stats['pruned_count']} "
+                        f"old tool outputs (~{_stats['estimated_tokens_saved']} tokens saved)",
+                        force=True,
+                    )
+                    # Re-estimate after MicroCompact
+                    _preflight_tokens_mc = estimate_request_tokens_rough(
+                        messages,
+                        system_prompt=active_system_prompt or "",
+                        tools=self.tools or None,
+                    )
+                    if _preflight_tokens_mc < self.context_compressor.threshold_tokens:
+                        # MicroCompact brought us under threshold — skip formal compression
+                        pass
+        # ── End MicroCompact ────────────────────────────────────────────────
+
+        # Proactive context compression: if we're already near the threshold
         # while having a large existing session — compress proactively rather
         # than waiting for an API error (which might be caught as a non-retryable
         # 4xx and abort the request entirely).
@@ -10911,9 +10802,49 @@ class AIAgent:
                     self._touch_activity(
                         f"API error recovery (attempt {retry_count}/{max_retries})"
                     )
-                    
+
+                    # Define error_type before Circuit Breaker uses it.
                     error_type = type(api_error).__name__
                     error_msg = str(api_error).lower()
+
+                    # ── Circuit Breaker ────────────────────────────────────────────────
+                    # Compute a simple fingerprint of the error so we can tell
+                    # when the *same* error is repeating across providers.
+                    _error_fingerprint = f"{error_type}:{status_code}:{classified.reason.value if classified and classified.reason else 'unknown'}"
+                    if _error_fingerprint == self._last_api_error_hash:
+                        self._consecutive_api_errors += 1
+                    else:
+                        self._consecutive_api_errors = 1
+                        self._last_api_error_hash = _error_fingerprint
+
+                    if self._consecutive_api_errors >= self._max_consecutive_api_errors:
+                        self._vprint(
+                            f"{self.log_prefix}❌ Circuit breaker triggered: "
+                            f"{self._consecutive_api_errors} consecutive identical API errors. Stopping.",
+                            force=True,
+                        )
+                        logging.error(
+                            "Circuit breaker: %s consecutive identical errors (%s). Aborting.",
+                            self._consecutive_api_errors,
+                            _error_fingerprint,
+                        )
+                        self._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": (
+                                f"❌ 操作停止: API 在 {self._consecutive_api_errors} 次重试后仍持续失败.\n"
+                                f"错误类型: {error_type}\n"
+                                f"状态码: {status_code or 'N/A'}\n"
+                                f"建议: 检查网络连接、API 密钥或 provider 状态。"
+                            ),
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "failed": True,
+                            "circuit_breaker": True,
+                        }
+
+                    # ── End Circuit Breaker ─────────────────────────────────────────────
+
                     _error_summary = self._summarize_api_error(api_error)
                     logger.warning(
                         "API call failed (attempt %s/%s) error_type=%s %s summary=%s",
