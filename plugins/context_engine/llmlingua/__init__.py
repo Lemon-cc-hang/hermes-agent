@@ -29,7 +29,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# ── Optional dependency guard ─────────────────────────────────────────────────
+try:
+    import torch
+    _HAS_TORCH = True
+except Exception:
+    _HAS_TORCH = False
+
+# ── Optional dependency guard ─────────────────────────────────────────────────────────────────────────────────────
 _HAS_LLMLINGUA = False
 try:
     from llmlingua import PromptCompressor
@@ -306,8 +312,17 @@ class LLMLinguaCompressor(ContextEngine):
             return False
 
         try:
-            device_map = "cpu" if self._force_cpu else None
             # LLMLingua-2 模型需要启用 use_llmlingua2 模式
+            # 注：llmlingua 0.2.2 中 device_map=None 且 use_llmlingua2=True 时会触发
+            # "argument of type 'NoneType' is not iterable" bug，所以当 force_cpu=False
+            # 时也显式传 'auto' 而非 None
+            # 另外在 Apple Silicon (MPS) 上需要显式指定 device_map='mps' 或 'cpu'
+            if self._force_cpu:
+                device_map = "cpu"
+            elif _HAS_TORCH and torch.backends.mps.is_available():
+                device_map = "mps"
+            else:
+                device_map = "cpu"
             self._compressor = PromptCompressor(
                 model_name=self._model_name,
                 device_map=device_map,
@@ -373,7 +388,7 @@ class LLMLinguaCompressor(ContextEngine):
             result = self._compressor.compress_prompt(
                 text,
                 rate=self._rate,
-                force_tokens=[focus_topic] if focus_topic else None,
+                force_tokens=[focus_topic] if focus_topic else [],
             )
             compressed = result.get("compressed_prompt", "")
             if not compressed:
