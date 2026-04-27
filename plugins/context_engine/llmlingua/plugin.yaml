@@ -1,0 +1,7 @@
+name: llmlingua
+description: >
+  Token-level prompt compression via microsoft/LLMLingua.
+  Optional dependency — falls back to built-in compressor when llmlingua
+  is not installed. Preserves original text structure (non-generative).
+author: Hermes Agent
+version: 0.1.0
