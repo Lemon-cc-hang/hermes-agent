@@ -8,7 +8,7 @@
 
 ```bash
 # 1. 进入你的 hermes-agent 目录
-cd ~/.hermes/hermes-agent   # 或你的安装路径
+cd ~/.hermes/hermes-agent
 
 # 2. 添加 fork remote
 git remote add lemon https://github.com/Lemon-cc-hang/hermes-agent.git
@@ -19,9 +19,15 @@ git fetch lemon feat/agent-optimizations-rebased
 # 4. 创建本地分支并切换
 git checkout -b my-optimizations lemon/feat/agent-optimizations-rebased
 
-# 5. 验证安装
+# 5. 安装可选依赖（如需要 LLMLingua 压缩插件）
+uv pip install llmlingua transformers torch
+
+# 6. 验证安装
 python -m py_compile run_agent.py
 python -c "from agent.core_utils import IterationBudget; from agent.micro_compact import MicroCompact; from agent.file_memory import FileMemoryStore; print('✅ All imports OK')"
+
+# 7. 重启 Gateway/CLI
+pm2 restart all   # 或: hermes kill && hermes run
 ```
 
 ---
@@ -33,17 +39,11 @@ python -c "from agent.core_utils import IterationBudget; from agent.micro_compac
 ```bash
 cd ~/.hermes/hermes-agent
 
-# 添加 remote
 git remote add lemon https://github.com/Lemon-cc-hang/hermes-agent.git
-
-# 获取分支
 git fetch lemon
-
-# 创建本地分支
 git checkout -b optimizations lemon/feat/agent-optimizations-rebased
 
-# 如果想回到原始版本:
-# git checkout main
+# 回滚: git checkout main
 ```
 
 ---
@@ -55,54 +55,116 @@ git checkout -b optimizations lemon/feat/agent-optimizations-rebased
 ```bash
 cd ~/.hermes/hermes-agent
 
-# 添加 remote
 git remote add lemon https://github.com/Lemon-cc-hang/hermes-agent.git
 git fetch lemon
 
 # 查看提交列表
 git log --oneline lemon/feat/agent-optimizations-rebased -5
-# 输出:
 # 382e22a7 补充 Skill Tier、Project KB、LLMLingua 三个遗漏优化＋验证清单
 # d4ebc2cf 重新应用 Circuit Breaker、MicroCompact、FileMemoryStore 和模块拆分
 
-# Cherry-pick 单独提交 (示例: 只要最新的优化)
+# 只应用核心优化 (无需额外依赖)
 git cherry-pick d4ebc2cf --no-commit
+
+# 或只应用 Skill Tier + Project KB + LLMLingua
+git cherry-pick 382e22a7 --no-commit
 ```
 
 ---
 
 ## 方式三: 叠加优化到当前分支
 
-适合：不想切换分支，直接在当前工作分支上应用
+适合：不想切换分支
 
 ```bash
 cd ~/.hermes/hermes-agent
 
-# 添加 remote
 git remote add lemon https://github.com/Lemon-cc-hang/hermes-agent.git
 git fetch lemon
 
-# 清洁工作区 (或 git stash 保存当前改动)
-git checkout .
+# 保存当前改动
+git stash
 
-# 软合并优化分支
+# 软合并
 git merge lemon/feat/agent-optimizations-rebased --no-commit
 
-# 如果有冲突，解决后:
-# git add -A && git commit -m "Apply optimizations"
+# 解决冲突后提交
+git add -A && git commit -m "Apply optimizations"
+```
+
+---
+
+## 依赖安装
+
+### 必须依赖 (无需额外安装)
+所有核心优化使用 Hermes 原有依赖，无需额外安装。
+
+### 可选依赖
+
+| 优化 | 依赖 | 安装命令 |
+|------|------|---------|
+| **LLMLingua 压缩插件** | llmlingua, transformers, torch | `uv pip install llmlingua transformers torch` |
+| **Project KB 知识库** | chromadb, sentence-transformers | `uv pip install chromadb sentence-transformers` |
+
+```bash
+# 安装所有可选依赖
+uv pip install llmlingua transformers torch chromadb sentence-transformers
+```
+
+> 注：如果不安装可选依赖，相关功能会自动跳过，不影响其他优化。
+
+---
+
+## 数据库初始化
+
+### Skill Tier SQLite 统计表
+
+Skill Tier 系统会自动创建所需数据库和目录，无需手动操作：
+
+```bash
+# 第一次启动时自动创建：
+# ~/.hermes/skills/pinned/
+# ~/.hermes/skills/high/
+# ~/.hermes/skills/low/
+# ~/.hermes/skills/archived/
+# ~/.hermes/skills/skill_stats.db  (SQLite 统计表)
+```
+
+如果需要手动初始化：
+
+```bash
+cd ~/.hermes/hermes-agent
+python -c "
+from agent.skill_tier_manager import _ensure_tier_dirs
+_ensure_tier_dirs()
+print('✅ Skill Tier directories created')
+"
+```
+
+### FileMemoryStore 记忆目录
+
+```bash
+# 第一次使用时自动创建：
+# ~/.hermes/memory/
+#   ├── user/
+#   ├── project/
+#   ├── task/
+#   ├── error/
+#   ├── learning/
+#   └── context/
 ```
 
 ---
 
 ## 验证安装
 
-执行完成后，运行验证脚本：
-
 ```bash
 cd ~/.hermes/hermes-agent
+
+# 语法检查
 python -m py_compile run_agent.py
 
-# 验证所有模块
+# 模块导入
 python -c "
 from agent.core_utils import IterationBudget, install_safe_stdio
 from agent.runner_utils import _MAX_TOOL_WORKERS, _is_destructive_command
@@ -110,54 +172,65 @@ from agent.micro_compact import MicroCompact
 from agent.file_memory import FileMemoryStore
 from agent.skill_tier_manager import TIER_DIRS
 import tools.project_kb as pkb
+
 print('✅ All optimizations loaded successfully')
 print('✅ Skill Tier dirs:', list(TIER_DIRS.keys()))
 print('✅ Project KB tools:', [x for x in dir(pkb) if x.startswith('project_kb_')])
+"
+
+# 功能测试
+python -c "
+from agent.file_memory import FileMemoryStore
+import tempfile, shutil
+tmp = tempfile.mkdtemp()
+fms = FileMemoryStore(tmp)
+fms.save('pref_test', 'Java 风格偏好', category='user', tags=['style'])
+assert fms.load('pref_test', 'user') == 'Java 风格偏好'
+shutil.rmtree(tmp)
+print('✅ FileMemoryStore CRUD OK')
 "
 ```
 
 ---
 
-## 启动 Gateway/CLI
+## 重启服务
 
 ```bash
-# 如果之前运行了 gateway，需要重启
-pm2 restart all   # 如果使用 pm2
+# 如果使用 pm2 运行 gateway
+pm2 restart all
 
 # 或手动重启
 hermes kill
 hermes run
 
-# CLI 模式直接启动即可
+# CLI 模式直接启动
 hermes
 ```
+
+> 重启后所有优化自动生效，无需额外配置。
 
 ---
 
 ## 优化清单
 
-安装完成后，你将获得以下所有优化：
-
-| # | 优化 | 文件 |
-|---|------|------|
-| 1 | **Skill Tier 分层** | `agent/skill_tier_manager.py` |
-| 2 | **Context Compressor 修复** | `agent/context_compressor.py` |
-| 3 | **Project KB** | `tools/project_kb.py` |
-| 4 | **File Tools 去重** | `tools/file_tools.py` |
-| 5 | **Terminal 截断优化** | `tools/terminal_tool.py` |
-| 6 | **Terminal 重试保护** | `tools/terminal_tool.py` |
-| 7 | **LLMLingua 插件** | `plugins/context_engine/llmlingua/` |
-| 8 | **Circuit Breaker** | `run_agent.py` |
-| 9 | **Compact Boundary** | `run_agent.py` |
-| 10 | **MicroCompact** | `agent/micro_compact.py` |
-| 11 | **模块拆分** | `agent/core_utils.py` + `agent/runner_utils.py` |
-| 12 | **FileMemoryStore** | `agent/file_memory.py` |
+| # | 优化 | 文件 | 依赖 |
+|---|------|------|------|
+| 1 | **Skill Tier 分层** | `agent/skill_tier_manager.py` | 无 (自带 SQLite) |
+| 2 | **Context Compressor 修复** | `agent/context_compressor.py` | 无 |
+| 3 | **Project KB 知识库** | `tools/project_kb.py` | chromadb (可选) |
+| 4 | **File Tools 去重** | `tools/file_tools.py` | 无 |
+| 5 | **Terminal 截断优化** | `tools/terminal_tool.py` | 无 |
+| 6 | **Terminal 重试保护** | `tools/terminal_tool.py` | 无 |
+| 7 | **LLMLingua 压缩插件** | `plugins/context_engine/llmlingua/` | llmlingua (可选) |
+| 8 | **Circuit Breaker** | `run_agent.py` | 无 |
+| 9 | **Compact Boundary** | `run_agent.py` | 无 |
+| 10 | **MicroCompact** | `agent/micro_compact.py` | 无 |
+| 11 | **模块拆分** | `agent/core_utils.py` + `agent/runner_utils.py` | 无 |
+| 12 | **FileMemoryStore** | `agent/file_memory.py` | 无 (纯文件) |
 
 ---
 
 ## 回滚
-
-如果想恢复原始版本：
 
 ```bash
 cd ~/.hermes/hermes-agent
@@ -169,24 +242,27 @@ git stash pop
 
 ---
 
-## 问题排查
+## 故障排查
 
 ### Q: 冲突解决
 ```bash
-# 如果 merge 时有冲突
 git status  # 查看冲突文件
-# 手动编辑冲突文件后:
-git add -A
-git commit -m "Merge optimizations"
+# 手动编辑后:
+git add -A && git commit -m "Merge optimizations"
 ```
 
-### Q: 依赖缺失
+### Q: 缺少依赖
 ```bash
-# 如果缺少 llmlingua 等依赖
-pip install llmlingua transformers torch
-# 或
-uv pip install llmlingua transformers torch
+# 如果提示缺少 chromadb 或 llmlingua
+uv pip install llmlingua transformers torch chromadb sentence-transformers
+```
+
+### Q: 数据库初始化失败
+```bash
+# 手动创建目录
+mkdir -p ~/.hermes/skills/{pinned,high,low,archived}
+mkdir -p ~/.hermes/memory/{user,project,task,error,learning,context}
 ```
 
 ### Q: 验证失败
-查看 `VERIFICATION_CHECKLIST.md` 中的详细验证步骤，或在 issue 中反馈。
+查看 `VERIFICATION_CHECKLIST.md` 或提交 issue。
