@@ -77,11 +77,23 @@ from tools.browser_tool import cleanup_browser
 
 
 from hermes_constants import OPENROUTER_BASE_URL
+from agent.core_utils import IterationBudget, install_safe_stdio
+from agent.runner_utils import (
+    _should_parallelize_tool_batch,
+    _extract_parallel_scope_path,
+    _paths_overlap,
+    _is_destructive_command,
+    _MAX_TOOL_WORKERS,
+    _NEVER_PARALLEL_TOOLS,
+    _PARALLEL_SAFE_TOOLS,
+    _PATH_SCOPED_TOOLS,
+)
 
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import build_memory_context_block, sanitize_context
 from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
+from agent.micro_compact import MicroCompact, _COMPACTABLE_TOOLS
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
@@ -199,49 +211,6 @@ def _install_safe_stdio() -> None:
             setattr(sys, stream_name, _SafeWriter(stream))
 
 
-class IterationBudget:
-    """Thread-safe iteration counter for an agent.
-
-    Each agent (parent or subagent) gets its own ``IterationBudget``.
-    The parent's budget is capped at ``max_iterations`` (default 90).
-    Each subagent gets an independent budget capped at
-    ``delegation.max_iterations`` (default 50) — this means total
-    iterations across parent + subagents can exceed the parent's cap.
-    Users control the per-subagent limit via ``delegation.max_iterations``
-    in config.yaml.
-
-    ``execute_code`` (programmatic tool calling) iterations are refunded via
-    :meth:`refund` so they don't eat into the budget.
-    """
-
-    def __init__(self, max_total: int):
-        self.max_total = max_total
-        self._used = 0
-        self._lock = threading.Lock()
-
-    def consume(self) -> bool:
-        """Try to consume one iteration.  Returns True if allowed."""
-        with self._lock:
-            if self._used >= self.max_total:
-                return False
-            self._used += 1
-            return True
-
-    def refund(self) -> None:
-        """Give back one iteration (e.g. for execute_code turns)."""
-        with self._lock:
-            if self._used > 0:
-                self._used -= 1
-
-    @property
-    def used(self) -> int:
-        return self._used
-
-    @property
-    def remaining(self) -> int:
-        with self._lock:
-            return max(0, self.max_total - self._used)
-
 
 # Tools that must never run concurrently (interactive / user-facing).
 # When any of these appear in a batch, we fall back to sequential execution.
@@ -265,113 +234,13 @@ _PARALLEL_SAFE_TOOLS = frozenset({
 # File tools can run concurrently when they target independent paths.
 _PATH_SCOPED_TOOLS = frozenset({"read_file", "write_file", "patch"})
 
-# Maximum number of concurrent worker threads for parallel tool execution.
-_MAX_TOOL_WORKERS = 8
 
-# Patterns that indicate a terminal command may modify/delete files.
-_DESTRUCTIVE_PATTERNS = re.compile(
-    r"""(?:^|\s|&&|\|\||;|`)(?:
-        rm\s|rmdir\s|
-        mv\s|
-        sed\s+-i|
-        truncate\s|
-        dd\s|
-        shred\s|
-        git\s+(?:reset|clean|checkout)\s
-    )""",
-    re.VERBOSE,
-)
-# Output redirects that overwrite files (> but not >>)
-_REDIRECT_OVERWRITE = re.compile(r'[^>]>[^>]|^>[^>]')
+# ──────────────────────────────────────────────────────────────────────────────
+# OpenAI ↔ Anthropic format helpers
 
 
-def _is_destructive_command(cmd: str) -> bool:
-    """Heuristic: does this terminal command look like it modifies/deletes files?"""
-    if not cmd:
-        return False
-    if _DESTRUCTIVE_PATTERNS.search(cmd):
-        return True
-    if _REDIRECT_OVERWRITE.search(cmd):
-        return True
-    return False
-
-
-def _should_parallelize_tool_batch(tool_calls) -> bool:
-    """Return True when a tool-call batch is safe to run concurrently."""
-    if len(tool_calls) <= 1:
-        return False
-
-    tool_names = [tc.function.name for tc in tool_calls]
-    if any(name in _NEVER_PARALLEL_TOOLS for name in tool_names):
-        return False
-
-    reserved_paths: list[Path] = []
-    for tool_call in tool_calls:
-        tool_name = tool_call.function.name
-        try:
-            function_args = json.loads(tool_call.function.arguments)
-        except Exception:
-            logging.debug(
-                "Could not parse args for %s — defaulting to sequential; raw=%s",
-                tool_name,
-                tool_call.function.arguments[:200],
-            )
-            return False
-        if not isinstance(function_args, dict):
-            logging.debug(
-                "Non-dict args for %s (%s) — defaulting to sequential",
-                tool_name,
-                type(function_args).__name__,
-            )
-            return False
-
-        if tool_name in _PATH_SCOPED_TOOLS:
-            scoped_path = _extract_parallel_scope_path(tool_name, function_args)
-            if scoped_path is None:
-                return False
-            if any(_paths_overlap(scoped_path, existing) for existing in reserved_paths):
-                return False
-            reserved_paths.append(scoped_path)
-            continue
-
-        if tool_name not in _PARALLEL_SAFE_TOOLS:
-            return False
-
-    return True
-
-
-def _extract_parallel_scope_path(tool_name: str, function_args: dict) -> Path | None:
-    """Return the normalized file target for path-scoped tools."""
-    if tool_name not in _PATH_SCOPED_TOOLS:
-        return None
-
-    raw_path = function_args.get("path")
-    if not isinstance(raw_path, str) or not raw_path.strip():
-        return None
-
-    expanded = Path(raw_path).expanduser()
-    if expanded.is_absolute():
-        return Path(os.path.abspath(str(expanded)))
-
-    # Avoid resolve(); the file may not exist yet.
-    return Path(os.path.abspath(str(Path.cwd() / expanded)))
-
-
-def _paths_overlap(left: Path, right: Path) -> bool:
-    """Return True when two paths may refer to the same subtree."""
-    left_parts = left.parts
-    right_parts = right.parts
-    if not left_parts or not right_parts:
-        # Empty paths shouldn't reach here (guarded upstream), but be safe.
-        return bool(left_parts) == bool(right_parts) and bool(left_parts)
-    common_len = min(len(left_parts), len(right_parts))
-    return left_parts[:common_len] == right_parts[:common_len]
-
-
-
+# Surrogate code-point regex — used by _sanitize_surrogates below.
 _SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
-
-
 
 
 def _sanitize_surrogates(text: str) -> str:
@@ -1016,6 +885,13 @@ class AIAgent:
         self._current_tool: str | None = None
         self._api_call_count: int = 0
 
+        # Circuit breaker — consecutive API error tracking.
+        # When the same error recurs N times, stop retrying to prevent
+        # infinite loops (e.g. fallback A → fallback B → fallback A).
+        self._consecutive_api_errors: int = 0
+        self._max_consecutive_api_errors: int = 9  # 3 retries × 3 providers max
+        self._last_api_error_hash: str = ""  # Fingerprint of the last error
+
         # Rate limit tracking — updated from x-ratelimit-* response headers
         # after each API call.  Accessed by /usage slash command.
         self._rate_limit_state: Optional["RateLimitState"] = None
@@ -1491,6 +1367,16 @@ class AIAgent:
                 logger.warning("Memory provider plugin init failed: %s", _mpe)
                 self._memory_manager = None
 
+        # FileMemoryStore — zero-DB pure file memory layer.
+        # Always initialized, independent of external memory plugins.
+        self._file_memory = None
+        try:
+            from agent.file_memory import FileMemoryStore
+            self._file_memory = FileMemoryStore()
+            logger.info("FileMemoryStore initialized at %s", self._file_memory.memory_dir)
+        except Exception as _fme:
+            logger.warning("FileMemoryStore init failed: %s", _fme)
+
         # Inject memory provider tool schemas into the tool surface.
         # Skip tools whose names already exist (plugins may register the
         # same tools via ctx.register_tool(), which lands in self.tools
@@ -1695,6 +1581,9 @@ class AIAgent:
                 provider=self.provider,
                 api_mode=self.api_mode,
             )
+        # MicroCompact — zero-API-call lightweight compressor for tool outputs.
+        # Fires at 50-75% token usage, before the full summarizer at >=75%.
+        self._micro_compact = MicroCompact()
         self.compression_enabled = compression_enabled
 
         # Reject models whose context window is below the minimum required
@@ -4070,6 +3959,37 @@ class AIAgent:
                 _ext_mem_block = self._memory_manager.build_system_prompt()
                 if _ext_mem_block:
                     prompt_parts.append(_ext_mem_block)
+            except Exception:
+                pass
+
+        # FileMemoryStore — inject relevant file memories into system prompt.
+        # Lightweight: only includes "user" and "project" categories to avoid
+        # bloating the system prompt.  Searches for keywords from the session
+        # context to find relevant memories.
+        if self._file_memory:
+            try:
+                _fm = self._file_memory
+                # Always include user preferences
+                _user_prefs = _fm.list_all(category="user")
+                if _user_prefs.get("user"):
+                    _mem_parts = ["## User Preferences (from file memory)\n"]
+                    for entry in _user_prefs["user"][:5]:  # Max 5 entries
+                        _content = _fm.load(entry["key"], category="user")
+                        if _content:
+                            _mem_parts.append(f"- {entry['key']}: {_content[:200]}")
+                    if len(_mem_parts) > 1:
+                        prompt_parts.append("\n".join(_mem_parts))
+
+                # Include project context
+                _project_ctx = _fm.list_all(category="project")
+                if _project_ctx.get("project"):
+                    _mem_parts = ["## Project Context (from file memory)\n"]
+                    for entry in _project_ctx["project"][:3]:  # Max 3 entries
+                        _content = _fm.load(entry["key"], category="project")
+                        if _content:
+                            _mem_parts.append(f"- {entry['key']}: {_content[:200]}")
+                    if len(_mem_parts) > 1:
+                        prompt_parts.append("\n".join(_mem_parts))
             except Exception:
                 pass
 
@@ -7395,6 +7315,27 @@ class AIAgent:
         self.context_compressor.last_prompt_tokens = _compressed_est
         self.context_compressor.last_completion_tokens = 0
 
+        # ── Compact Boundary marker ───────────────────────────────
+        # Inject a boundary marker into the summary message so the model
+        # knows not to reference details from compressed turns.  Inspired
+        # by Claude Code's /compact boundary mechanism.
+        if compressed and len(compressed) >= 2:
+            _boundary_marker = (
+                f"\n\n<compact-boundary"
+                f" original_messages='{_pre_msg_count}'"
+                f" compressed_messages='{len(compressed)}'"
+                f" original_tokens='{approx_tokens or 'unknown'}'"
+                f" compression_count='{self.context_compressor.compression_count}'"
+                f" timestamp='{datetime.now().isoformat()}'"
+                f" />\n"
+                f"All conversation above this boundary has been summarized. "
+                f"Do not reference specific details from earlier turns unless they appear in the summary."
+            )
+            _first = compressed[0]
+            if isinstance(_first.get("content"), str):
+                _first["content"] = _first.get("content", "") + _boundary_marker
+            _first["_compact_boundary"] = True
+
         # Clear the file-read dedup cache.  After compression the original
         # read content is summarised away — if the model re-reads the same
         # file it needs the full content, not a "file unchanged" stub.
@@ -8500,6 +8441,11 @@ class AIAgent:
         self._mute_post_response = False
         self._unicode_sanitization_passes = 0
 
+        # Reset circuit breaker at the start of each new turn.
+        # Each turn gets a fresh error budget.
+        self._consecutive_api_errors = 0
+        self._last_api_error_hash = ""
+
         # Pre-turn connection health check: detect and clean up dead TCP
         # connections left over from provider outages or dropped streams.
         # This prevents the next API call from hanging on a zombie socket.
@@ -8696,6 +8642,31 @@ class AIAgent:
                     )
                     if _preflight_tokens < self.context_compressor.threshold_tokens:
                         break  # Under threshold
+            elif _preflight_tokens >= int(self.context_compressor.context_length * 0.50):
+                # MicroCompact: zero-API-call lightweight compression for tool outputs.
+                # Fires at 50-75% token usage, before the full summarizer at >=75%.
+                _mc = getattr(self, "_micro_compact", None)
+                if _mc:
+                    _orig_len = len(messages)
+                    messages = _mc.compact(messages, target_token_reduction=0.15)
+                    _stats = _mc.get_stats()
+                    if _stats["pruned_count"] > 0:
+                        logger.info(
+                            "MicroCompact: %d tool outputs cleared (~%d tokens saved)",
+                            _stats["pruned_count"],
+                            _stats["estimated_tokens_saved"],
+                        )
+                        if not self.quiet_mode:
+                            self._safe_print(
+                                f"\U0001f9f9 MicroCompact: cleared {_stats['pruned_count']} old tool outputs "
+                                f"(~{_stats['estimated_tokens_saved']} tokens saved)"
+                            )
+                        # Re-estimate after MicroCompact
+                        _preflight_tokens = estimate_request_tokens_rough(
+                            messages,
+                            system_prompt=active_system_prompt or "",
+                            tools=self.tools or None,
+                        )
 
         # Plugin hook: pre_llm_call
         # Fired once per turn before the tool-calling loop.  Plugins can
@@ -9763,6 +9734,10 @@ class AIAgent:
                             clear_nous_rate_limit()
                         except Exception:
                             pass
+                    # Reset circuit breaker on success — the model is
+                    # responding normally again.
+                    self._consecutive_api_errors = 0
+                    self._last_api_error_hash = ""
                     self._touch_activity(f"API call #{api_call_count} completed")
                     break  # Success, exit retry loop
 
@@ -10056,6 +10031,39 @@ class AIAgent:
 
                     retry_count += 1
                     elapsed_time = time.time() - api_start_time
+
+                    # ── Circuit breaker ──────────────────────────────────────
+                    # Track consecutive API errors to prevent infinite loops.
+                    # When fallback chains cycle (A→B→A), the same error
+                    # fingerprints recur.  Stop after N consecutive identical
+                    # errors across the full turn.
+                    _err_fingerprint = f"{type(api_error).__name__}:{status_code or 'none'}:{classified.reason.value}"
+                    if _err_fingerprint == self._last_api_error_hash:
+                        self._consecutive_api_errors += 1
+                    else:
+                        self._consecutive_api_errors = 1
+                        self._last_api_error_hash = _err_fingerprint
+
+                    if self._consecutive_api_errors >= self._max_consecutive_api_errors:
+                        _cb_msg = (
+                            f"❌ Circuit breaker triggered: "
+                            f"{self._consecutive_api_errors} consecutive identical API errors "
+                            f"({_err_fingerprint}). Stopping to prevent infinite loop."
+                        )
+                        logger.error(_cb_msg)
+                        self._emit_status(_cb_msg)
+                        if not self.quiet_mode:
+                            self._safe_print(f"{self.log_prefix}{_cb_msg}")
+                        self._persist_session(messages, conversation_history)
+                        return {
+                            "messages": messages,
+                            "completed": False,
+                            "api_calls": api_call_count,
+                            "error": _cb_msg,
+                            "failed": True,
+                            "circuit_breaker": True,
+                        }
+
                     self._touch_activity(
                         f"API error recovery (attempt {retry_count}/{max_retries})"
                     )
